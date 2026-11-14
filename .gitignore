@@ -1,0 +1,53 @@
+# =============================================================================
+# CAP Assistant — Security & Privacy .gitignore
+# =============================================================================
+
+# Bytecode e ambientes virtuais Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Pastas de compilação do PyInstaller (contêm caminhos locais de usuário do Windows)
+build/
+dist/
+*.exe
+*.zip
+
+# Backups locais, configurações pessoais do usuário e arquivos de log
+backups/
+GITHUB_UPLOAD_READY/
+templates/
+bot_settings.json
+calibration.json
+*.log
+cap_assistant_log_*.txt
+
+# Scripts legados de calibração v1 (substituídos pelo Calibrador Visual integrado na GUI)
+calibrate.py
+CALIBRAR.bat
+
+# =============================================================================
+# Proteção de Capturas de Tela / Mídia (Abordagem Lista Branca)
+# Bloqueia qualquer print de tela, vídeo ou dump de matriz (.png, .jpg, .npz),
+# permitindo APENAS os 7 arquivos de referência visual oficiais do VisionReader!
+# =============================================================================
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+*.mkv
+*.mp4
+*.npz
+
+!prompt_light_ref.png
+!prompt_rebirth_ref.png
+!prompt_hold_ref.png
+!prompt_hold_inner.png
+!table_crystal_ref.png
+!egg_refs_7.npz
+!altar_pillar_refs.npz
+!cap_assistant.ico
