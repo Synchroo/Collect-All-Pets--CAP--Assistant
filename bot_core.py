@@ -1912,6 +1912,8 @@ class RebirthBot:
         confirm_check_count = 0
         complete_confirm_count = 0
         manual_reset_streak = 0
+        occluded_streak = 0
+        last_occlusion_warn = 0.0
         mismatch_count = 0
         tier_sync_count = 0
         quest_ready_count = 0
@@ -2185,6 +2187,26 @@ class RebirthBot:
                 self.status.checkmarks_found = checks
                 self.status.detected_active_egg = active_egg
 
+                # Linhas sem Check cobertas por um painel escuro (ex.: Estatísticas do Roblox):
+                # o bot não consegue ler esses tiers e pode ficar esperando um Check que já existe.
+                occluded_rows = [
+                    i for i in self.vision.checklist_occluded_rows(frame) if not tier_status[i]
+                ]
+                occluded_streak = occluded_streak + 1 if occluded_rows else 0
+                checklist_blocked_msg = ""
+                if occluded_streak >= 10:
+                    names = ", ".join(EGG_CYCLE[i] for i in occluded_rows)
+                    checklist_blocked_msg = (
+                        f"⚠️ Checklist encoberto ({names}) — feche o painel que está por cima "
+                        f"(ex.: Estatísticas do Roblox) para o bot ler os Checks."
+                    )
+                    if time.time() - last_occlusion_warn >= 30.0:
+                        last_occlusion_warn = time.time()
+                        log.warning(
+                            f"⚠️ [Checklist] Linha(s) {names} encoberta(s) por um painel escuro "
+                            f"(ex.: Estatísticas do Roblox). Feche o painel para o bot conseguir ler o Checklist."
+                        )
+
                 # Todos os 8 checks verdes marcados (240/240 - incluindo Mythical completo)
                 if all(tier_status) and (
                     self.status.current_tier_index >= 6
@@ -2333,6 +2355,8 @@ class RebirthBot:
                         f"🥚 Monitorando {cur_name} (0/{cur_total} -> {cur_total}/{cur_total}) "
                         f"[{checks}/8 Checks verdes]"
                     )
+                if checklist_blocked_msg:
+                    self.status.last_action = checklist_blocked_msg
                 self._notify()
 
                 if not self._sleep(self.cfg.screen_check_hz):

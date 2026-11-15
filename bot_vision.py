@@ -685,6 +685,32 @@ class VisionReader:
 
         return tier_status
 
+    def checklist_occluded_rows(self, frame: np.ndarray, min_dark_ratio: float = 0.55) -> List[int]:
+        """
+        Retorna os índices (0..7) das linhas do Checklist cobertas por um painel escuro e sem cor,
+        como o painel de Estatísticas de desempenho do Roblox (Data Send / Instances / Memory).
+        Numa linha encoberta ~80% da área fica cinza-escura (S < 45, V 15..75); numa linha normal, < 3%.
+        Usa a grade de linhas calculada pela última chamada de analyze_tiers() no mesmo tamanho de janela.
+        """
+        if frame is None or frame.size == 0:
+            return []
+        h, w = frame.shape[:2]
+        if self._cached_row_ys is None or self._cached_step is None or self._cached_shape != (h, w):
+            return []
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        x1, x2 = max(1, int(w * 0.003)), int(w * 0.155)
+        half = self._cached_step * 0.4
+        rows = []
+        for i, y in enumerate(self._cached_row_ys[:8]):
+            y1, y2 = max(0, int(y - half)), min(h, int(y + half))
+            reg = hsv[y1:y2, x1:x2]
+            if reg.size == 0:
+                continue
+            dark = np.mean((reg[:, :, 1] < 45) & (reg[:, :, 2] >= 15) & (reg[:, :, 2] <= 75))
+            if dark >= min_dark_ratio:
+                rows.append(i)
+        return rows
+
     def is_all_tiers_complete(self, frame: np.ndarray) -> bool:
         """Retorna True quando todos os 8 tiers (240/240) estão com o Check verde marcado."""
         return all(self.analyze_tiers(frame))
