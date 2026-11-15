@@ -941,6 +941,16 @@ class RebirthBot:
             self.push_live_frame(hwnd, f_final, immediate_overlay=True)
         return f_final is not None and self.vision.detect_altar_table(f_final) is not None
 
+    def _capture_settled_or(
+        self, hwnd: int, fallback: Optional[np.ndarray], max_wait: float = 0.75
+    ) -> Optional[np.ndarray]:
+        """
+        Igual a `_capture_settled_altar_frame(...) or fallback`, mas seguro para arrays NumPy:
+        `ndarray or x` lança ValueError ("truth value of an array ... is ambiguous").
+        """
+        f = self._capture_settled_altar_frame(hwnd, max_wait=max_wait)
+        return f if f is not None else fallback
+
     def _capture_settled_altar_frame(self, hwnd: int, max_wait: float = 1.15) -> Optional[np.ndarray]:
         """
         Aguarda o personagem/câmera desacelerar após o último movimento até que a posição da
@@ -1011,7 +1021,7 @@ class RebirthBot:
 
             # Se a tela de Pet Descoberto ('Continue') estiver aberta, fecha com [E] antes de avaliar a Mesa
             if self._dismiss_pet_continue_if_needed(hwnd, frame0):
-                frame0 = self._capture_settled_altar_frame(hwnd, max_wait=0.75) or frame0
+                frame0 = self._capture_settled_or(hwnd, frame0, max_wait=0.75)
 
             # Se já estiver diante da Mesa Branca com [E] Rebirth ativo, executa o Rebirth direto
             if not force_test and self.cfg.auto_interact_e:
@@ -1029,7 +1039,7 @@ class RebirthBot:
                         self.vision.notify_circuit_end()
                         return True
                     log.warning("⚠️ [Altar] Rebirth não confirmado no início da volta. Seguindo para as 4 Tochas...")
-                    frame0 = self._capture_settled_altar_frame(hwnd, max_wait=0.75) or frame0
+                    frame0 = self._capture_settled_or(hwnd, frame0, max_wait=0.75)
 
             # Se a Mesa Branca não estiver visível no início, executa Auto-Recuperação (Tocha -> Mesa P0)
             if self.vision.detect_altar_table(frame0, allow_kinematic=False) is None:
@@ -1039,7 +1049,7 @@ class RebirthBot:
                     self._notify()
                     self.vision.notify_circuit_end()
                     return False
-                frame0 = self._capture_settled_altar_frame(hwnd, max_wait=0.80) or frame0
+                frame0 = self._capture_settled_or(hwnd, frame0, max_wait=0.80)
 
             # Inicia o rastreamento cinemático inteligente ancorado no ponto original P0
             self.vision.notify_circuit_start(frame0)
@@ -1066,7 +1076,7 @@ class RebirthBot:
 
                 # Se abriu a tela de Pet Descoberto ('Continue') durante a caminhada, fecha com [E] imediatamente
                 if self._dismiss_pet_continue_if_needed(hwnd, f_step):
-                    f_step = self._capture_settled_altar_frame(hwnd, max_wait=0.75) or f_step
+                    f_step = self._capture_settled_or(hwnd, f_step, max_wait=0.75)
 
                 # Se durante o trajeto o Checklist já zerou (Rebirth ocorreu), encerra a volta
                 if not force_test and sum(self.vision.analyze_tiers(f_step)) == 0 and self.vision.locate_egg_button_details(f_step) is not None:
