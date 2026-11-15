@@ -5,6 +5,7 @@ CAP Rebirth Bot - DirectInput Controller v3.4
 """
 
 import time
+import threading
 import random
 import logging
 import ctypes
@@ -90,6 +91,7 @@ class DirectInputController:
 
     def __init__(self):
         self._held_keys = set()
+        self._autorepeat = {}  # tecla -> (threading.Event de parada, thread de auto-repeat)
         self.is_bot_moving_mouse: bool = False
         self.last_expected_cursor_pos = self._safe_get_cursor()
         self.last_bot_input_tick: int = self._get_last_input_tick()
@@ -427,8 +429,18 @@ class DirectInputController:
             self.sync_cursor_baseline()
             self.is_bot_moving_mouse = False
 
-    def key_down(self, key: str = "e", hwnd: int = None):
-        """Pressiona e mantém a tecla (ex: 'e') segurada via ScanCode de hardware."""
+    # Auto-repeat do teclado físico do Windows: ~250ms de atraso inicial e depois ~30 eventos/s
+    AUTOREPEAT_DELAY_SEC = 0.25
+    AUTOREPEAT_INTERVAL_SEC = 0.033
+
+    def key_down(self, key: str = "e", hwnd: int = None, autorepeat: bool = False):
+        """
+        Pressiona e mantém a tecla (ex: 'e') segurada via ScanCode de hardware.
+
+        autorepeat=True imita uma tecla física segurada, reenviando o evento de "tecla pressionada"
+        (~30x/s) até key_up(). Sem isso o Roblox cancela o hold do ProximityPrompt '[E] Rebirth'
+        cerca de 0,5s depois de começar (o círculo de progresso aparece e some).
+        """
         if hwnd:
             self.force_foreground(hwnd)
         k = key.lower()
@@ -439,15 +451,45 @@ class DirectInputController:
                 vk, scan = GAME_KEY_MAP[k]
                 user32.keybd_event(vk, scan, KEYEVENTF_SCANCODE, 0)
             self._held_keys.add(k)
+            if autorepeat and k in GAME_KEY_MAP:
+                self._start_autorepeat(k)
         except Exception as e:
             log.warning(f"Erro em key_down({k}): {e}")
         finally:
             self.sync_cursor_baseline()
             self.is_bot_moving_mouse = False
 
+    def _start_autorepeat(self, k: str):
+        self._stop_autorepeat(k)
+        stop_evt = threading.Event()
+        vk, scan = GAME_KEY_MAP[k]
+
+        def _run():
+            if stop_evt.wait(self.AUTOREPEAT_DELAY_SEC):
+                return
+            while not stop_evt.is_set():
+                try:
+                    user32.keybd_event(vk, scan, KEYEVENTF_SCANCODE, 0)
+                    self.last_bot_action_ts = time.time()
+                except Exception:
+                    pass
+                stop_evt.wait(self.AUTOREPEAT_INTERVAL_SEC)
+
+        th = threading.Thread(target=_run, name=f"autorepeat-{k}", daemon=True)
+        self._autorepeat[k] = (stop_evt, th)
+        th.start()
+
+    def _stop_autorepeat(self, k: str):
+        entry = self._autorepeat.pop(k, None)
+        if entry:
+            stop_evt, th = entry
+            stop_evt.set()
+            th.join(timeout=0.5)
+
     def key_up(self, key: str = "e"):
         """Solta a tecla que estava segurada."""
         k = key.lower()
+        self._stop_autorepeat(k)
         self.is_bot_moving_mouse = True
         try:
             pydirectinput.keyUp(k)

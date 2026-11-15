@@ -731,15 +731,67 @@ class RebirthBot:
             self.status.detected_active_egg = self.vision.detect_active_egg(f_end)
             self._notify()
 
-    def _hold_e_until_rebirth_complete(self, hwnd: int):
+    # Tiers que SEMPRE voltam a 0 após o Rebirth (Common..Prodigious). Ascended e Mythical podem
+    # continuar 6/6 ✔ logo depois do Rebirth (confirmado em jogo), então não entram na verificação.
+    RESET_TIERS = 6
+
+    @classmethod
+    def _early_checks(cls, tiers: List[bool]) -> int:
+        return sum(tiers[: cls.RESET_TIERS])
+
+    def _is_checklist_reset(self, frame: Optional[np.ndarray]) -> bool:
+        """
+        True quando o Checklist aparece reiniciado pelo Rebirth (Common..Prodigious todos sem Check)
+        E a HUD normal do jogo está visível (barra de Ovos ou banner de Missão). Exigir a HUD evita
+        confundir um Checklist apenas encoberto (tela de Pet Descoberto, janela aberta, frame preto)
+        com um Rebirth real.
+        """
+        if frame is None or frame.size == 0:
+            return False
+        if self._early_checks(self.vision.analyze_tiers(frame)) != 0:
+            return False
+        return (
+            self.vision.locate_egg_button_details(frame) is not None
+            or self.vision.locate_quest_banner_details(frame) is not None
+        )
+
+    def _wait_checklist_reset(self, hwnd: int, timeout: float = 2.5, required_streak: int = 2) -> bool:
+        """Aguarda até 'timeout' segundos o Checklist zerar em 'required_streak' leituras consecutivas."""
+        t0 = time.time()
+        streak = 0
+        while time.time() - t0 < timeout:
+            if self._stop.is_set() or not self.status.running:
+                return False
+            if self._is_checklist_reset(self.vision.capture_window(hwnd)):
+                streak += 1
+                if streak >= required_streak:
+                    return True
+            else:
+                streak = 0
+            time.sleep(0.15)
+        return False
+
+    def _hold_e_until_rebirth_complete(self, hwnd: int) -> bool:
         """
         Mantém a tecla [E] pressionada continuamente (key_down('e')) até completar
         o círculo branco em volta da bola cinza (Foto 3) e o Checklist zerar.
+
+        Retorna True SOMENTE se o Rebirth foi confirmado visualmente (Common..Prodigious passaram
+        de marcados para todos sem Check, com a HUD visível). Retorna False se o [E] foi solto sem
+        o Checklist reiniciar (ex.: prompt classificado errado numa tocha, personagem saiu do
+        alcance, bot parado), para que o chamador NÃO conte um Rebirth falso nem troque o ovo com [Z].
         """
+        pre_frame = self.vision.capture_window(hwnd)
+        pre_checks = (
+            self._early_checks(self.vision.analyze_tiers(pre_frame)) if pre_frame is not None else None
+        )
+
         self.controller.force_foreground(hwnd)
-        self.controller.key_down("e", hwnd)
+        self.controller.key_down("e", hwnd, autorepeat=True)
         start_t = time.time()
         missing_count = 0
+        reset_streak = 0
+        confirmed = False
 
         try:
             while time.time() - start_t < 6.5:
@@ -749,9 +801,15 @@ class RebirthBot:
                 elapsed = time.time() - start_t
 
                 frame = self.vision.capture_window(hwnd)
-                if frame is not None and elapsed >= 3.2:
-                    if sum(self.vision.analyze_tiers(frame)) == 0:
-                        break
+                # O hold do '[E] Rebirth' leva ~1,4s no jogo; confere o Checklist a partir de 1s
+                if frame is not None and elapsed >= 1.0:
+                    if self._is_checklist_reset(frame):
+                        reset_streak += 1
+                        if reset_streak >= 2:
+                            confirmed = True
+                            break
+                    else:
+                        reset_streak = 0
 
                 if elapsed < self.cfg.rebirth_hold_time:
                     continue
@@ -766,6 +824,45 @@ class RebirthBot:
                             break
         finally:
             self.controller.key_up("e")
+
+        # O Checklist pode levar alguns instantes para zerar depois que o círculo completa
+        if not confirmed:
+            confirmed = self._wait_checklist_reset(hwnd, timeout=2.5)
+
+        # Checklist já estava reiniciado antes de segurar [E]: "reiniciado depois" não prova nada
+        if confirmed and pre_checks == 0:
+            log.warning(
+                "⚠️ [Rebirth] Checklist (Common..Prodigious) já estava sem Checks antes de segurar [E] — "
+                "não é possível confirmar o Renascimento visualmente."
+            )
+            confirmed = False
+
+        if not confirmed:
+            log.warning(
+                "⚠️ [Rebirth] [E] solto sem o Checklist reiniciar — Renascimento NÃO confirmado "
+                "(contador e troca de ovo [Z] mantidos)."
+            )
+        return confirmed
+
+    def _hold_rebirth_with_retries(self, hwnd: int, max_attempts: int = 3) -> bool:
+        """
+        Segura [E] no '[E] Rebirth' e, se o Rebirth não for confirmado mas o prompt continuar
+        visível (as 4 tochas seguem acesas), tenta de novo ali mesmo, sem refazer a volta pelo Altar.
+        """
+        for attempt in range(1, max_attempts + 1):
+            if self._hold_e_until_rebirth_complete(hwnd):
+                return True
+            if self._stop.is_set() or not self.status.running or attempt == max_attempts:
+                break
+            f = self.vision.capture_window(hwnd)
+            if f is None or self.vision.detect_prompt_type(f)[0] != "REBIRTH":
+                break
+            log.info(
+                f"🔁 [Rebirth] '[E] Rebirth' ainda visível — segurando [E] de novo "
+                f"({attempt + 1}/{max_attempts}) sem refazer a volta das tochas..."
+            )
+            time.sleep(0.3)
+        return False
 
     def _execute_post_rebirth_switch(self, hwnd: int):
         """
@@ -794,8 +891,7 @@ class RebirthBot:
         while time.time() - wait_start < 2.5:
             if self._stop.is_set() or not self.status.running:
                 return
-            f_chk = self.vision.capture_window(hwnd)
-            if f_chk is not None and sum(self.vision.analyze_tiers(f_chk)) == 0:
+            if self._is_checklist_reset(self.vision.capture_window(hwnd)):
                 break
             time.sleep(0.15)
 
@@ -876,6 +972,16 @@ class RebirthBot:
             self.push_live_frame(hwnd, f_final, immediate_overlay=True)
         return f_final is not None and self.vision.detect_altar_table(f_final) is not None
 
+    def _capture_settled_or(
+        self, hwnd: int, fallback: Optional[np.ndarray], max_wait: float = 0.75
+    ) -> Optional[np.ndarray]:
+        """
+        Igual a `_capture_settled_altar_frame(...) or fallback`, mas seguro para arrays NumPy:
+        `ndarray or x` lança ValueError ("truth value of an array ... is ambiguous").
+        """
+        f = self._capture_settled_altar_frame(hwnd, max_wait=max_wait)
+        return f if f is not None else fallback
+
     def _capture_settled_altar_frame(self, hwnd: int, max_wait: float = 1.15) -> Optional[np.ndarray]:
         """
         Aguarda o personagem/câmera desacelerar após o último movimento até que a posição da
@@ -946,7 +1052,15 @@ class RebirthBot:
 
             # Se a tela de Pet Descoberto ('Continue') estiver aberta, fecha com [E] antes de avaliar a Mesa
             if self._dismiss_pet_continue_if_needed(hwnd, frame0):
-                frame0 = self._capture_settled_altar_frame(hwnd, max_wait=0.75) or frame0
+                frame0 = self._capture_settled_or(hwnd, frame0, max_wait=0.75)
+
+            # As tochas só aceitam [E] Light com o Checklist em 240/240: antes de repetir a volta,
+            # confere se ainda está completo (pode ter havido Rebirth não detectado na 1ª volta)
+            if circuit_attempt > 1 and not force_test and not all(self.vision.analyze_tiers(frame0)):
+                log.info("ℹ️ [Altar] Checklist não está mais em 240/240 — cancelando a 2ª volta pelas tochas.")
+                self.vision.reset_lit_torches_memory()
+                self.vision.notify_circuit_end()
+                return False
 
             # Se já estiver diante da Mesa Branca com [E] Rebirth ativo, executa o Rebirth direto
             if not force_test and self.cfg.auto_interact_e:
@@ -959,10 +1073,12 @@ class RebirthBot:
                     self.status.state = BotState.REBIRTH_PHASE
                     self.status.last_action = "✨ [E Rebirth] ativo! Segurando [E]..."
                     self._notify()
-                    self._hold_e_until_rebirth_complete(hwnd)
-                    self._execute_post_rebirth_switch(hwnd)
-                    self.vision.notify_circuit_end()
-                    return True
+                    if self._hold_e_until_rebirth_complete(hwnd):
+                        self._execute_post_rebirth_switch(hwnd)
+                        self.vision.notify_circuit_end()
+                        return True
+                    log.warning("⚠️ [Altar] Rebirth não confirmado no início da volta. Seguindo para as 4 Tochas...")
+                    frame0 = self._capture_settled_or(hwnd, frame0, max_wait=0.75)
 
             # Se a Mesa Branca não estiver visível no início, executa Auto-Recuperação (Tocha -> Mesa P0)
             if self.vision.detect_altar_table(frame0, allow_kinematic=False) is None:
@@ -972,7 +1088,7 @@ class RebirthBot:
                     self._notify()
                     self.vision.notify_circuit_end()
                     return False
-                frame0 = self._capture_settled_altar_frame(hwnd, max_wait=0.80) or frame0
+                frame0 = self._capture_settled_or(hwnd, frame0, max_wait=0.80)
 
             # Inicia o rastreamento cinemático inteligente ancorado no ponto original P0
             self.vision.notify_circuit_start(frame0)
@@ -999,10 +1115,11 @@ class RebirthBot:
 
                 # Se abriu a tela de Pet Descoberto ('Continue') durante a caminhada, fecha com [E] imediatamente
                 if self._dismiss_pet_continue_if_needed(hwnd, f_step):
-                    f_step = self._capture_settled_altar_frame(hwnd, max_wait=0.75) or f_step
+                    f_step = self._capture_settled_or(hwnd, f_step, max_wait=0.75)
 
                 # Se durante o trajeto o Checklist já zerou (Rebirth ocorreu), encerra a volta
-                if not force_test and sum(self.vision.analyze_tiers(f_step)) == 0 and self.vision.locate_egg_button_details(f_step) is not None:
+                # (Ascended/Mythical podem seguir 6/6 após o Rebirth: olha só Common..Prodigious)
+                if not force_test and self._is_checklist_reset(f_step):
                     self.vision.reset_lit_torches_memory()
                     self.vision.notify_circuit_end()
                     return True
@@ -1230,7 +1347,9 @@ class RebirthBot:
                         )
                         self._notify()
                         if not force_test or self.cfg.auto_interact_e:
-                            self._hold_e_until_rebirth_complete(hwnd)
+                            if not self._hold_rebirth_with_retries(hwnd):
+                                # Sai da espera e cai na lógica de repetição da volta (limpa tochas + P0)
+                                break
                             self._execute_post_rebirth_switch(hwnd)
                         self.vision.notify_circuit_end()
                         return True
@@ -1670,9 +1789,9 @@ class RebirthBot:
                     time.sleep(0.25)
                 elif p_type == "REBIRTH":
                     log.info(f"✨ [Janela #{prof.index}] [E Rebirth] detectado! Segurando [E]...")
-                    self._hold_e_until_rebirth_complete(w_hwnd)
-                    self._execute_post_rebirth_switch(w_hwnd)
-                    prof.rebirth_count += 1
+                    # _execute_post_rebirth_switch já incrementa prof.rebirth_count (evita contagem dupla)
+                    if self._hold_e_until_rebirth_complete(w_hwnd):
+                        self._execute_post_rebirth_switch(w_hwnd)
 
             # D) Troca de Ovos [Z] & Altar na janela secundária (SOMENTE se ativado nela -> Economia de CPU)
             if (prof.auto_eggs or prof.auto_move_altar) and w_frame is not None:
@@ -1682,8 +1801,8 @@ class RebirthBot:
                     log.info(
                         f"🏛️ [Janela #{prof.index}] 240/240 completo! Executando Altar..."
                     )
+                    # Rebirths confirmados já são contados dentro do circuito (_execute_post_rebirth_switch)
                     self._execute_altar_circuit(w_hwnd)
-                    prof.rebirth_count += 1
                 elif prof.auto_eggs:
                     t_idx, _ = self.vision.get_target_from_tiers(w_tiers)
                     if t_idx < 8 and all(w_tiers[:t_idx]):
@@ -1750,8 +1869,9 @@ class RebirthBot:
         primary_prof = self.get_primary_profile()
         if not primary_prof:
             return "Roblox não encontrado!"
-        self._hold_e_until_rebirth_complete(primary_prof.hwnd)
-        return "Tecla [E] mantida pressionada até completar o Renascimento!"
+        if self._hold_e_until_rebirth_complete(primary_prof.hwnd):
+            return "Tecla [E] mantida pressionada até completar o Renascimento!"
+        return "Tecla [E] mantida pressionada, mas o Renascimento não foi confirmado (Checklist não zerou)."
 
     # ── Loop Principal ────────────────────────────────────────────────────────
 
@@ -1791,6 +1911,9 @@ class RebirthBot:
 
         confirm_check_count = 0
         complete_confirm_count = 0
+        manual_reset_streak = 0
+        occluded_streak = 0
+        last_occlusion_warn = 0.0
         mismatch_count = 0
         tier_sync_count = 0
         quest_ready_count = 0
@@ -1916,7 +2039,12 @@ class RebirthBot:
                         )
                         self._notify()
 
-                        self._hold_e_until_rebirth_complete(active_hwnd)
+                        if not self._hold_e_until_rebirth_complete(active_hwnd):
+                            self.status.last_action = "⚠️ [E Rebirth] solto sem o Checklist zerar — Rebirth não confirmado."
+                            self._notify()
+                            if not self._sleep(0.5):
+                                break
+                            continue
                         self._execute_post_rebirth_switch(active_hwnd)
                         was_all_complete = False
                         complete_confirm_count = 0
@@ -2059,6 +2187,26 @@ class RebirthBot:
                 self.status.checkmarks_found = checks
                 self.status.detected_active_egg = active_egg
 
+                # Linhas sem Check cobertas por um painel escuro (ex.: Estatísticas do Roblox):
+                # o bot não consegue ler esses tiers e pode ficar esperando um Check que já existe.
+                occluded_rows = [
+                    i for i in self.vision.checklist_occluded_rows(frame) if not tier_status[i]
+                ]
+                occluded_streak = occluded_streak + 1 if occluded_rows else 0
+                checklist_blocked_msg = ""
+                if occluded_streak >= 10:
+                    names = ", ".join(EGG_CYCLE[i] for i in occluded_rows)
+                    checklist_blocked_msg = (
+                        f"⚠️ Checklist encoberto ({names}) — feche o painel que está por cima "
+                        f"(ex.: Estatísticas do Roblox) para o bot ler os Checks."
+                    )
+                    if time.time() - last_occlusion_warn >= 30.0:
+                        last_occlusion_warn = time.time()
+                        log.warning(
+                            f"⚠️ [Checklist] Linha(s) {names} encoberta(s) por um painel escuro "
+                            f"(ex.: Estatísticas do Roblox). Feche o painel para o bot conseguir ler o Checklist."
+                        )
+
                 # Todos os 8 checks verdes marcados (240/240 - incluindo Mythical completo)
                 if all(tier_status) and (
                     self.status.current_tier_index >= 6
@@ -2098,11 +2246,18 @@ class RebirthBot:
                     continue
                 else:
                     complete_confirm_count = 0
-                    if checks == 0:
+                    # Common..Prodigious sem Check (Ascended/Mythical podem seguir 6/6 após o Rebirth)
+                    if self._early_checks(tier_status) == 0:
                         self.vision.reset_lit_torches_memory()
 
-                # Se estava em 240/240 e o Checklist acabou de zerar (Rebirth concluído manualmente)
-                if was_all_complete and checks == 0:
+                # Se estava em 240/240 e o Checklist acabou de reiniciar (Rebirth concluído manualmente).
+                # Exige 2 leituras seguidas com HUD visível para não reagir a 1 frame com falha.
+                if was_all_complete and self._is_checklist_reset(frame):
+                    manual_reset_streak += 1
+                else:
+                    manual_reset_streak = 0
+                if was_all_complete and manual_reset_streak >= 2:
+                    manual_reset_streak = 0
                     was_all_complete = False
                     complete_confirm_count = 0
                     confirm_check_count = 0
@@ -2200,6 +2355,8 @@ class RebirthBot:
                         f"🥚 Monitorando {cur_name} (0/{cur_total} -> {cur_total}/{cur_total}) "
                         f"[{checks}/8 Checks verdes]"
                     )
+                if checklist_blocked_msg:
+                    self.status.last_action = checklist_blocked_msg
                 self._notify()
 
                 if not self._sleep(self.cfg.screen_check_hz):
